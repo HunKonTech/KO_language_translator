@@ -115,61 +115,159 @@ def translate_text(text, target_lang):
     raise RuntimeError("translation retries exhausted")
 
 
+# Tolerates case changes, stray spaces and native digits (`\d` is Unicode-aware)
+# the translator may introduce into an XPLH<n>X sentinel.
+_SENTINEL_RE = re.compile(r"X\s*P\s*L\s*H\s*(\d+)\s*X", re.IGNORECASE)
+
+
+def _protect_placeholders(text):
+    """Swap {placeholder} tokens for sentinels that survive machine translation intact."""
+    protected = text
+    tokens = PLACEHOLDER_RE.findall(text)
+    for i, token in enumerate(tokens):
+        protected = protected.replace(token, f"XPLH{i}X", 1)
+    return protected, tokens
+
+
+def _restore_placeholders(text, tokens):
+    if not tokens:
+        return text
+
+    def _token(match):
+        index = int(match.group(1))
+        return tokens[index] if index < len(tokens) else match.group(0)
+
+    return _SENTINEL_RE.sub(_token, text)
+
+
 def translate_preserving_placeholders(text, target_lang):
     """Translate `text` while keeping {placeholder} tokens untouched."""
     if text is None or text.strip() == "":
         return text
 
-    tokens = PLACEHOLDER_RE.findall(text)
-    if not tokens:
-        return translate_text(text, target_lang)
-
-    # Swap placeholders for sentinels that survive machine translation intact.
-    protected = text
-    restore = []
-    for i, token in enumerate(tokens):
-        sentinel = f"XPLH{i}X"
-        protected = protected.replace(token, sentinel, 1)
-        # Tolerate case changes and stray spaces the translator may introduce.
-        pattern = re.compile(r"\s*".join(re.escape(c) for c in sentinel), re.IGNORECASE)
-        restore.append((pattern, token))
-
+    protected, restore = _protect_placeholders(text)
     translated = translate_text(protected, target_lang) or protected
-    for pattern, token in restore:
-        translated = pattern.sub(token, translated)
-    return translated
+    return _restore_placeholders(translated, restore)
 
 
-def run_translations(worklist, translate_fn, workers, progress=None, describe=None):
-    """Translate `worklist` items concurrently, returning (item, translated) pairs.
+# ----------------------------------------------------------------------------
+# Batching: one request per language carries many texts
+# ----------------------------------------------------------------------------
 
-    Only the network-bound `translate_fn` calls run in the thread pool; results are
-    consumed on the calling thread, so progress printing and file writing stay serial.
+# Google blocks an IP that sends one request per text (thousands per run), so
+# texts are sent together, each after a numbered marker line, and the reply is
+# split at the markers. A batch whose markers do not come back intact is halved
+# and retried, down to one text per request.
+DEFAULT_BATCH_CHARS = 3000
+_SEGMENT_MARKER = "XSEG{}X"
+# Tolerates case changes, stray spaces and native digits (`\d` is Unicode-aware).
+_SEGMENT_RE = re.compile(r"X\s*S\s*E\s*G\s*(\d+)\s*X", re.IGNORECASE)
+
+
+def _is_blank(text):
+    return text is None or str(text).strip() == ""
+
+
+def _split_segments(translated, count):
+    """The texts between markers 0..count-1, or None unless all came back once, in order."""
+    matches = list(_SEGMENT_RE.finditer(translated))
+    if [int(m.group(1)) for m in matches] != list(range(count)):
+        return None
+    ends = [m.start() for m in matches[1:]] + [len(translated)]
+    parts = [translated[m.end():end].strip() for m, end in zip(matches, ends)]
+    return None if any(part == "" for part in parts) else parts
+
+
+def _translate_segments(texts, target_lang, protect_placeholders):
+    if len(texts) == 1:
+        if protect_placeholders:
+            return [translate_preserving_placeholders(texts[0], target_lang)]
+        return [translate_text(texts[0], target_lang)]
+
+    protected = [_protect_placeholders(t) if protect_placeholders else (t, []) for t in texts]
+    joined = "\n".join(f"{_SEGMENT_MARKER.format(i)}\n{text}" for i, (text, _) in enumerate(protected))
+    try:
+        parts = _split_segments(translate_text(joined, target_lang) or "", len(texts))
+    except (TooManyRequests, RequestError):
+        raise  # halving would only send more requests to a server refusing them
+    except Exception:
+        parts = None
+    if parts is None:
+        mid = len(texts) // 2
+        return (_translate_segments(texts[:mid], target_lang, protect_placeholders)
+                + _translate_segments(texts[mid:], target_lang, protect_placeholders))
+    return [_restore_placeholders(part, restore) for part, (_, restore) in zip(parts, protected)]
+
+
+def translate_texts(texts, target_lang, protect_placeholders=True):
+    """Translate `texts` into one language with as few requests as possible, in order."""
+    results = list(texts)
+    todo = [i for i, text in enumerate(texts) if not _is_blank(text)]
+    if todo:
+        translated = _translate_segments([texts[i] for i in todo], target_lang, protect_placeholders)
+        for i, value in zip(todo, translated):
+            results[i] = value
+    return results
+
+
+def chunk_worklist(worklist, lang_of, text_of, max_chars=DEFAULT_BATCH_CHARS):
+    """Group work items into per-language chunks of at most `max_chars` characters.
+
+    A text longer than `max_chars` gets a chunk of its own.
+    """
+    by_lang = {}
+    for item in worklist:
+        by_lang.setdefault(lang_of(item), []).append(item)
+
+    chunks = []
+    for items in by_lang.values():
+        chunk, size = [], 0
+        for item in items:
+            # The marker line costs a few characters too.
+            cost = len(text_of(item) or "") + len(_SEGMENT_MARKER.format(len(chunk))) + 2
+            if chunk and size + cost > max_chars:
+                chunks.append(chunk)
+                chunk, size = [], 0
+            chunk.append(item)
+            size += cost
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def run_translations(chunks, translate_fn, workers, progress=None, describe=None):
+    """Translate `chunks` (lists of work items) concurrently, returning (item, translated) pairs.
+
+    `translate_fn(chunk)` returns the translations of the chunk's items, in order.
+    Only these network-bound calls run in the thread pool; results are consumed on
+    the calling thread, so progress printing and file writing stay serial.
     """
     results = []
     failures = []
-    if not worklist:
+    if not chunks:
         return results
 
-    def _safe(item):
+    def _safe(chunk):
         try:
-            return translate_fn(item), None
+            return chunk, translate_fn(chunk), None
         except Exception as exc:  # keep going so partial results are still written
-            return (item, None), exc
+            return chunk, None, exc
 
-    workers = max(1, min(workers, len(worklist)))
+    workers = max(1, min(workers, len(chunks)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        for (item, translated), error in executor.map(_safe, worklist):
-            if error is not None:
-                failures.append((item, error))
-            else:
-                results.append((item, translated))
-            if progress is not None:
-                shown = f"FAILED: {error}" if error else (
-                    describe(item, translated) if describe else str(translated))
-                progress.step(shown)
-            elif describe is not None and not error:
-                print(describe(item, translated))
+        for chunk, translations, error in executor.map(_safe, chunks):
+            for i, item in enumerate(chunk):
+                translated = None if error is not None else translations[i]
+                if error is not None:
+                    failures.append((item, error))
+                else:
+                    results.append((item, translated))
+                if progress is not None:
+                    shown = f"FAILED: {error}" if error else (
+                        describe(item, translated) if describe else str(translated))
+                    progress.step(shown)
+                elif describe is not None and not error:
+                    print(describe(item, translated))
 
     if failures:
         print(f"\n{len(failures)} item(s) could not be translated and were left unchanged:")
@@ -286,7 +384,8 @@ def _escape_ts_string(value):
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def process_i18n_ts(file_path, force_translate, exclude_languages, source_lang, workers=8):
+def process_i18n_ts(file_path, force_translate, exclude_languages, source_lang, workers=8,
+                     batch_chars=DEFAULT_BATCH_CHARS):
     with open(file_path, "r", encoding="utf-8") as fh:
         content = fh.read()
 
@@ -334,8 +433,8 @@ def process_i18n_ts(file_path, force_translate, exclude_languages, source_lang, 
 
     progress = ProgressPrinter(len(worklist), recent=4)
     results = run_translations(
-        worklist,
-        lambda item: (item, translate_preserving_placeholders(item[2], item[0])),
+        chunk_worklist(worklist, lambda item: item[0], lambda item: item[2], batch_chars),
+        lambda chunk: translate_texts([item[2] for item in chunk], chunk[0][0]),
         workers,
         progress=progress,
         describe=lambda item, translated: f"({item[0]}) {item[1]}: {item[2]} --> {translated}",
@@ -366,7 +465,8 @@ def process_i18n_ts(file_path, force_translate, exclude_languages, source_lang, 
         fh.write(new_content)
     print("\ni18n TypeScript translation completed!")
 
-def process_resx_files(directory, force_translate, exclude_languages, workers=8):
+def process_resx_files(directory, force_translate, exclude_languages, workers=8,
+                       batch_chars=DEFAULT_BATCH_CHARS):
     original_file = os.path.join(directory, "AppRes.resx")
     if not os.path.exists(original_file):
         print("Original resx file not found!")
@@ -408,8 +508,8 @@ def process_resx_files(directory, force_translate, exclude_languages, workers=8)
     # --- Phase B: translate every missing key across all languages in parallel ---
     progress = ProgressPrinter(len(worklist), recent=4)
     results = run_translations(
-        worklist,
-        lambda item: (item, translate_text(item[3], item[0][:2])),
+        chunk_worklist(worklist, lambda item: item[0], lambda item: item[3], batch_chars),
+        lambda chunk: translate_texts([item[3] for item in chunk], chunk[0][0][:2], protect_placeholders=False),
         workers,
         progress=progress,
         describe=lambda item, translated: f"({item[0]}) {item[1]}: {item[3]} --> {translated}",
@@ -449,25 +549,28 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force re-translate all entries")
     parser.add_argument("--new-only", action="store_true", help="Only translate new entries")
     parser.add_argument("--workers", type=int, default=8, help="Parallel translation workers (default: 8)")
+    parser.add_argument("--batch-chars", type=int, default=DEFAULT_BATCH_CHARS,
+                        help=f"Characters sent per request, many texts at once (default: {DEFAULT_BATCH_CHARS}, max 4900)")
 
     args = parser.parse_args()
 
     exclude_languages = args.exclude_languages.split(',') if args.exclude_languages else []
+    batch_chars = max(1, min(args.batch_chars, 4900))
 
     if args.i18n_file:
         if args.force:
-            process_i18n_ts(args.i18n_file, True, exclude_languages, args.i18n_source_lang, args.workers)
+            process_i18n_ts(args.i18n_file, True, exclude_languages, args.i18n_source_lang, args.workers, batch_chars)
             sys.exit(0)
         elif args.new_only:
-            process_i18n_ts(args.i18n_file, False, exclude_languages, args.i18n_source_lang, args.workers)
+            process_i18n_ts(args.i18n_file, False, exclude_languages, args.i18n_source_lang, args.workers, batch_chars)
             sys.exit(0)
 
     if args.resx_directory:
         if args.force:
-            process_resx_files(args.resx_directory, True, exclude_languages, args.workers)
+            process_resx_files(args.resx_directory, True, exclude_languages, args.workers, batch_chars)
             sys.exit(0)
         elif args.new_only:
-            process_resx_files(args.resx_directory, False, exclude_languages, args.workers)
+            process_resx_files(args.resx_directory, False, exclude_languages, args.workers, batch_chars)
             sys.exit(0)
     
     while True:

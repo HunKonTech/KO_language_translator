@@ -90,6 +90,12 @@ This Python script automates the translation of `.resx` resource files for a pro
     ```sh
     python main.py --new-only --resx-directory /path/to/resx --workers 4
     ```
+- `--batch-chars <n>`: Characters sent to Google Translate in one request (default:
+  `3000`, at most `4900`). Many texts of the same language travel together, each after a
+  numbered `XSEG<n>X` marker line, and the reply is split at the markers, so a language
+  costs a handful of requests instead of one per text; sending one request per text gets
+  the IP blocked by Google. A batch whose markers do not come back intact is halved and
+  sent again, down to one text per request.
 
 ### TypeScript i18n support
 
@@ -147,6 +153,7 @@ const DICTS: Record<Lang, Dict> = {
 - `--workers <n>`: Parallel translation workers (default `8`). All missing keys across
   every language are translated concurrently; the `DICTS` object is then rebuilt and
   written once, so the file stays consistent.
+- `--batch-chars <n>`: Characters per request, see above (default `3000`).
 - Use together with `--new-only` **or** `--force`, and optionally
   `--exclude-languages` (comma-separated language keys to skip, e.g. languages
   you maintain by hand).
@@ -267,6 +274,12 @@ Ez a Python szkript automatikusan lefordítja a `.resx` erőforrásfájlokat egy
     ```sh
     python main.py --new-only --resx-directory /path/to/resx --workers 4
     ```
+- `--batch-chars <n>`: Egy kérésben a Google Fordítónak küldött karakterek száma
+  (alapértelmezés: `3000`, legfeljebb `4900`). Egy nyelv több szövege együtt megy el,
+  mindegyik egy számozott `XSEG<n>X` jelölősor után, és a válasz a jelölők mentén válik
+  szét, így egy nyelv néhány kérésbe kerül szövegenkénti egy helyett; a szövegenkénti
+  kérésekért a Google letiltja az IP-címet. Ha egy köteg jelölői nem érkeznek vissza
+  épen, a köteg megfeleződik és újra elmegy, legrosszabb esetben szövegenként.
 
 ### TypeScript i18n támogatás
 
@@ -326,6 +339,7 @@ const DICTS: Record<Lang, Dict> = {
 - `--workers <n>`: Párhuzamos fordító szálak száma (alapértelmezés: `8`). Az összes nyelv
   összes hiányzó kulcsa egyszerre fordul le; a `DICTS` objektum ezután egyszer épül újra és
   íródik ki, így a fájl konzisztens marad.
+- `--batch-chars <n>`: Karakterek kérésenként, lásd fent (alapértelmezés: `3000`).
 - A `--new-only` **vagy** `--force` kapcsolóval együtt használandó, opcionálisan
   a `--exclude-languages` kapcsolóval (vesszővel elválasztott nyelvi kulcsok,
   amiket ki kell hagyni – pl. amiket kézzel karbantartasz).
