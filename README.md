@@ -119,6 +119,9 @@ only passes that text on. If every service is skipped, all are tried again rathe
 failing at once. Argos downloads its language models (about 100 MB per pair, pivoting
 through English when there is no direct model) the first time a pair is needed. At the end
 of a run, a summary shows how many requests each service handled and why any was skipped.
+Azure also limits characters per sliding minute (about 33,300 on the free F0 tier), so
+Microsoft requests are paced to 27,000 characters/minute, and an HTTP 429 is retried up to
+6 times, waiting for `Retry-After` or 10-60 seconds.
 - **Example:**
   ```sh
   python main.py --new-only --resx-directory /path/to/resx --microsoft-key <key> --microsoft-region westeurope --deepl-key <key>
@@ -334,6 +337,10 @@ kimaradna, újra mindet megpróbálja, ahelyett hogy azonnal hibát adna. Az Arg
 nyelvpár első használatakor letölti a modelleket (páronként kb. 100 MB; ha nincs közvetlen
 modell, angolon keresztül fordít). A futás végén összesítő mutatja, melyik szolgáltató hány
 kérést kapott, és miért maradt ki valamelyik.
+Az Azure percenkénti karakterszámot is korlátoz (az ingyenes F0-n kb. 33 300 karakter egy
+csúszó percben), ezért a Microsoft-kérések percenként legfeljebb 27 000 karaktert küldenek,
+HTTP 429 esetén pedig legfeljebb 6-szor újrapróbálnak, a `Retry-After` szerint vagy 10-60
+másodpercet várva.
 - **Példa:**
   ```sh
   python main.py --new-only --resx-directory /path/to/resx --microsoft-key <kulcs> --microsoft-region westeurope --deepl-key <kulcs>

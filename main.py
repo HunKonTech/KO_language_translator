@@ -46,6 +46,7 @@ class ProgressPrinter:
         self.lines = []
         self._printed = 0
         self._finished = False
+        self._lock = threading.Lock()  # note() is called from worker threads
         if total == 0:
             print("Nothing to translate (no missing keys).")
 
@@ -65,14 +66,25 @@ class ProgressPrinter:
         self._printed = len(block)
 
     def step(self, message):
-        self.count += 1
-        self.lines.append(message)
-        self._render()
+        with self._lock:
+            self.count += 1
+            self.lines.append(message)
+            self._render()
+
+    def note(self, message):
+        """Show a status line (e.g. a rate-limit wait) without advancing the bar."""
+        with self._lock:
+            self.lines.append(message)
+            self._render()
 
     def done(self):
         if self.total and not self._finished:
             self._render()
         self._finished = True
+
+
+# Where engines report waits; run_translations points it at the live progress block.
+_status = print
 
 
 class _RateLimiter:
@@ -97,6 +109,26 @@ class _RateLimiter:
             self._next_allowed = max(self._next_allowed, time.monotonic() + delay)
 
 
+class _CharBudget:
+    """Per-engine characters-per-minute throttle shared by all worker threads.
+
+    Each request reserves len(text) / rate seconds, so any 60 s window carries at most
+    one minute's budget plus a single request."""
+
+    def __init__(self, chars_per_minute):
+        self._seconds_per_char = 60.0 / chars_per_minute
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self, chars):
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_allowed)
+            self._next_allowed = start + chars * self._seconds_per_char
+        if start > now:
+            time.sleep(start - now)
+
+
 # ----------------------------------------------------------------------------
 # Translation engines: Google first, then the configured fallbacks in order
 # (Microsoft -> DeepL -> offline Argos). An engine that is rate limited, out of
@@ -119,6 +151,10 @@ class TranslationUnavailable(Exception):
 class _TransientError(Exception):
     """A rate-limit or server error worth retrying after a backoff."""
 
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 def _lang_code(lang, aliases, default=lambda key: key.split("-")[0]):
     key = lang.strip().lower()
@@ -129,10 +165,14 @@ class _Engine:
     name = ""
     max_per_second = 4.0
     max_retries = 3
+    backoff_start = 1  # seconds; doubles per attempt up to backoff_cap
+    backoff_cap = 30
+    chars_per_minute = None  # set for services that throttle by characters
     retryable = (_TransientError,)
 
     def __init__(self):
         self.limiter = _RateLimiter(self.max_per_second)
+        self.char_budget = _CharBudget(self.chars_per_minute) if self.chars_per_minute else None
         self.disabled_until = 0.0
         self.last_error = None
         self.requests = 0
@@ -151,6 +191,8 @@ class _Engine:
     def translate(self, text, target_lang, source_lang):
         for attempt in range(self.max_retries):
             self.limiter.wait()
+            if self.char_budget:
+                self.char_budget.wait(len(text))
             try:
                 result = self._request(text, target_lang, source_lang)
                 with self._stats_lock:
@@ -159,9 +201,14 @@ class _Engine:
             except self.retryable as exc:
                 if attempt == self.max_retries - 1:
                     raise EngineUnavailable(f"{type(exc).__name__}: {exc}") from exc
-                # Exponential backoff with jitter; also pushes back the engine's limiter.
-                delay = min(2 ** attempt, 30) + random.uniform(0, 1)
+                # Honour Retry-After, else exponential backoff with jitter; also pushes back
+                # the engine's limiter so the other workers pause too.
+                retry_after = getattr(exc, "retry_after", None)
+                delay = (retry_after if retry_after is not None
+                         else min(self.backoff_start * 2 ** attempt, self.backoff_cap)) + random.uniform(0, 1)
                 self.limiter.push_back(delay)
+                _status(f"{self.name}: rate limited, waiting {delay:.0f}s "
+                        f"(retry {attempt + 1}/{self.max_retries - 1})")
                 time.sleep(delay)
         raise EngineUnavailable("retries exhausted")
 
@@ -186,17 +233,28 @@ def _check_http_status(response, unavailable_codes):
         return
     detail = response.text[:200]
     if response.status_code == 429 or response.status_code >= 500:
-        raise _TransientError(f"HTTP {response.status_code}: {detail}")
+        try:
+            retry_after = float(response.headers.get("Retry-After", ""))
+        except ValueError:
+            retry_after = None
+        raise _TransientError(f"HTTP {response.status_code}: {detail}", retry_after)
     if response.status_code in unavailable_codes:
         raise EngineUnavailable(f"HTTP {response.status_code}: {detail}")
     raise ValueError(f"HTTP {response.status_code}: {detail}")
 
 
 class MicrosoftEngine(_Engine):
-    """Azure AI Translator (free F0 tier: 2M characters/month)."""
+    """Azure AI Translator (free F0 tier: 2M characters/month).
+
+    Azure also caps characters per sliding minute (~33,300 on F0) and answers HTTP 429
+    above that, so requests are paced below it and a 429 waits up to a minute."""
 
     name = "microsoft"
     max_per_second = 10.0
+    max_retries = 6
+    backoff_start = 10
+    backoff_cap = 60
+    chars_per_minute = 27000
     _URL = "https://api.cognitive.microsofttranslator.com/translate"
     _ALIASES = {"zh": "zh-Hans", "zh-cn": "zh-Hans", "zh-hans": "zh-Hans",
                 "zh-tw": "zh-Hant", "zh-hant": "zh-Hant", "iw": "he", "no": "nb",
@@ -510,6 +568,8 @@ def run_translations(chunks, translate_fn, workers, progress=None, describe=None
     if not chunks:
         return results
     _CHAIN.reset_stats()
+    global _status
+    _status = progress.note if progress is not None else print
 
     def _safe(chunk):
         try:
@@ -533,6 +593,7 @@ def run_translations(chunks, translate_fn, workers, progress=None, describe=None
                 elif describe is not None and not error:
                     print(describe(item, translated))
 
+    _status = print
     # Finish the redrawn progress block before printing below it, or it overwrites these lines.
     if progress is not None:
         progress.done()
