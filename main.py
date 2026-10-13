@@ -7,6 +7,7 @@ import threading
 import argparse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+import requests
 from deep_translator import GoogleTranslator
 from deep_translator.exceptions import TooManyRequests, RequestError
 
@@ -44,6 +45,7 @@ class ProgressPrinter:
         self.count = 0
         self.lines = []
         self._printed = 0
+        self._finished = False
         if total == 0:
             print("Nothing to translate (no missing keys).")
 
@@ -68,12 +70,13 @@ class ProgressPrinter:
         self._render()
 
     def done(self):
-        if self.total:
+        if self.total and not self._finished:
             self._render()
+        self._finished = True
 
 
 class _RateLimiter:
-    """Process-wide throttle. Google's free endpoint allows ~5 requests/second."""
+    """Per-engine throttle shared by all worker threads."""
 
     def __init__(self, max_per_second=4.0):
         self._min_interval = 1.0 / max_per_second
@@ -89,30 +92,289 @@ class _RateLimiter:
                 now = time.monotonic()
             self._next_allowed = now + self._min_interval
 
-
-_RATE_LIMITER = _RateLimiter()
-
-# Retry on transient rate-limit / network errors before giving up on an item.
-_MAX_RETRIES = 6
+    def push_back(self, delay):
+        with self._lock:
+            self._next_allowed = max(self._next_allowed, time.monotonic() + delay)
 
 
-def translate_text(text, target_lang):
+# ----------------------------------------------------------------------------
+# Translation engines: Google first, then the configured fallbacks in order
+# (Microsoft -> DeepL -> offline Argos). An engine that is rate limited, out of
+# quota, rejects its key or cannot be reached is skipped for a while; an engine
+# that fails on one text (e.g. unsupported language) only passes that text on.
+# ----------------------------------------------------------------------------
+
+_ENGINE_COOLDOWN = 300  # seconds an unavailable engine is skipped
+_HTTP_TIMEOUT = 30
+
+
+class EngineUnavailable(Exception):
+    """The engine cannot serve requests for a while (rate limit, quota, key, network)."""
+
+
+class TranslationUnavailable(Exception):
+    """Every engine in the chain failed for a text."""
+
+
+class _TransientError(Exception):
+    """A rate-limit or server error worth retrying after a backoff."""
+
+
+def _lang_code(lang, aliases, default=lambda key: key.split("-")[0]):
+    key = lang.strip().lower()
+    return aliases[key] if key in aliases else default(key)
+
+
+class _Engine:
+    name = ""
+    max_per_second = 4.0
+    max_retries = 3
+    retryable = (_TransientError,)
+
+    def __init__(self):
+        self.limiter = _RateLimiter(self.max_per_second)
+        self.disabled_until = 0.0
+        self.last_error = None
+        self.requests = 0
+        self._stats_lock = threading.Lock()
+
+    def available(self):
+        return time.monotonic() >= self.disabled_until
+
+    def disable(self, reason):
+        self.disabled_until = time.monotonic() + _ENGINE_COOLDOWN
+        self.last_error = reason
+
+    def _request(self, text, target_lang, source_lang):
+        raise NotImplementedError
+
+    def translate(self, text, target_lang, source_lang):
+        for attempt in range(self.max_retries):
+            self.limiter.wait()
+            try:
+                result = self._request(text, target_lang, source_lang)
+                with self._stats_lock:
+                    self.requests += 1
+                return result
+            except self.retryable as exc:
+                if attempt == self.max_retries - 1:
+                    raise EngineUnavailable(f"{type(exc).__name__}: {exc}") from exc
+                # Exponential backoff with jitter; also pushes back the engine's limiter.
+                delay = min(2 ** attempt, 30) + random.uniform(0, 1)
+                self.limiter.push_back(delay)
+                time.sleep(delay)
+        raise EngineUnavailable("retries exhausted")
+
+
+class GoogleEngine(_Engine):
+    """Google's free endpoint allows ~5 requests/second."""
+
+    name = "google"
+    max_retries = 6
+    retryable = (TooManyRequests, RequestError)
+
+    def _request(self, text, target_lang, source_lang):
+        try:
+            return GoogleTranslator(source='auto', target=normalize_lang(target_lang)).translate(text)
+        except requests.exceptions.RequestException as exc:
+            raise EngineUnavailable(f"network error: {exc}") from exc
+
+
+def _check_http_status(response, unavailable_codes):
+    """Raise for a failed request: retryable, engine-wide or per-text errors."""
+    if response.status_code == 200:
+        return
+    detail = response.text[:200]
+    if response.status_code == 429 or response.status_code >= 500:
+        raise _TransientError(f"HTTP {response.status_code}: {detail}")
+    if response.status_code in unavailable_codes:
+        raise EngineUnavailable(f"HTTP {response.status_code}: {detail}")
+    raise ValueError(f"HTTP {response.status_code}: {detail}")
+
+
+class MicrosoftEngine(_Engine):
+    """Azure AI Translator (free F0 tier: 2M characters/month)."""
+
+    name = "microsoft"
+    max_per_second = 10.0
+    _URL = "https://api.cognitive.microsofttranslator.com/translate"
+    _ALIASES = {"zh": "zh-Hans", "zh-cn": "zh-Hans", "zh-hans": "zh-Hans",
+                "zh-tw": "zh-Hant", "zh-hant": "zh-Hant", "iw": "he", "no": "nb",
+                "pt-pt": "pt-pt"}
+
+    def __init__(self, api_key, region=None):
+        super().__init__()
+        self._headers = {"Ocp-Apim-Subscription-Key": api_key, "Content-Type": "application/json"}
+        if region:
+            self._headers["Ocp-Apim-Subscription-Region"] = region
+
+    def _request(self, text, target_lang, source_lang):
+        try:
+            response = requests.post(
+                self._URL,
+                params={"api-version": "3.0", "to": _lang_code(target_lang, self._ALIASES)},
+                headers=self._headers, json=[{"Text": text}], timeout=_HTTP_TIMEOUT)
+        except requests.exceptions.RequestException as exc:
+            raise EngineUnavailable(f"network error: {exc}") from exc
+        # 401: bad key or region, 403: free quota used up.
+        _check_http_status(response, unavailable_codes=(401, 403))
+        return response.json()[0]["translations"][0]["text"]
+
+
+class DeepLEngine(_Engine):
+    """DeepL API (Free keys end in ':fx', 500k characters/month)."""
+
+    name = "deepl"
+    max_per_second = 5.0
+    _ALIASES = {"en": "EN-US", "en-us": "EN-US", "en-gb": "EN-GB",
+                "pt": "PT-PT", "pt-pt": "PT-PT", "pt-br": "PT-BR",
+                "zh": "ZH-HANS", "zh-cn": "ZH-HANS", "zh-hans": "ZH-HANS",
+                "zh-tw": "ZH-HANT", "zh-hant": "ZH-HANT",
+                "no": "NB", "nb": "NB", "iw": "HE"}
+
+    def __init__(self, api_key):
+        super().__init__()
+        host = "api-free.deepl.com" if api_key.endswith(":fx") else "api.deepl.com"
+        self._url = f"https://{host}/v2/translate"
+        self._headers = {"Authorization": f"DeepL-Auth-Key {api_key}"}
+
+    def _request(self, text, target_lang, source_lang):
+        target = _lang_code(target_lang, self._ALIASES, default=lambda key: key.split("-")[0].upper())
+        try:
+            response = requests.post(
+                self._url, headers=self._headers,
+                json={"text": [text], "target_lang": target, "preserve_formatting": True},
+                timeout=_HTTP_TIMEOUT)
+        except requests.exceptions.RequestException as exc:
+            raise EngineUnavailable(f"network error: {exc}") from exc
+        # 401/403: bad key, 456: quota used up.
+        _check_http_status(response, unavailable_codes=(401, 403, 456))
+        return response.json()["translations"][0]["text"]
+
+
+class ArgosEngine(_Engine):
+    """Offline Argos Translate. Missing language models are downloaded on first use."""
+
+    name = "argos"
+    max_per_second = 1000.0
+    max_retries = 1
+    _ALIASES = {"zh-cn": "zh", "zh-hans": "zh", "zh-tw": "zt", "zh-hant": "zt",
+                "iw": "he", "no": "nb"}
+
+    def __init__(self):
+        super().__init__()
+        from argostranslate import package, settings, translate
+        self._package, self._settings, self._translate = package, settings, translate
+        self._lock = threading.Lock()  # model loading and installs are not thread safe
+        self._index_updated = False
+        self._missing = set()
+
+    def _translation(self, src, tgt):
+        from_lang = self._translate.get_language_from_code(src)
+        to_lang = self._translate.get_language_from_code(tgt)
+        if from_lang is None or to_lang is None:
+            return None
+        return from_lang.get_translation(to_lang)
+
+    def _install(self, src, tgt):
+        """Download the models for src -> tgt, directly or pivoting through English."""
+        if not self._index_updated:
+            self._package.update_package_index()
+            self._index_updated = True
+        if not os.path.exists(self._settings.local_package_index):
+            raise EngineUnavailable("Argos package index could not be downloaded")
+        print(f"Downloading Argos language model(s) for {src} -> {tgt}...")
+        if not self._package.install_package_for_language_pair(src, tgt):
+            for pair in ((src, "en"), ("en", tgt)):
+                if pair[0] != pair[1] and self._translation(*pair) is None:
+                    self._package.install_package_for_language_pair(*pair)
+
+    def _request(self, text, target_lang, source_lang):
+        src = _lang_code(source_lang, self._ALIASES)
+        tgt = _lang_code(target_lang, self._ALIASES)
+        with self._lock:
+            if (src, tgt) in self._missing:
+                raise ValueError(f"no Argos model for {src} -> {tgt}")
+            translation = self._translation(src, tgt)
+            if translation is None:
+                self._install(src, tgt)
+                translation = self._translation(src, tgt)
+            if translation is None:
+                self._missing.add((src, tgt))
+                raise ValueError(f"no Argos model for {src} -> {tgt}")
+            # Translate line by line, passing batch marker lines through untouched.
+            return "\n".join(
+                line if not line.strip() or _SEGMENT_RE.fullmatch(line.strip())
+                else translation.translate(line)
+                for line in text.split("\n"))
+
+
+class TranslatorChain:
+    def __init__(self, engines):
+        self.engines = engines
+
+    def describe(self):
+        return " -> ".join(engine.name for engine in self.engines)
+
+    def reset_stats(self):
+        for engine in self.engines:
+            engine.requests = 0
+            engine.last_error = None
+
+    def summary(self):
+        """Per-engine request counts and reasons, or None if only the first engine was needed."""
+        used = [e for e in self.engines if e.requests or e.last_error]
+        if not any(e.last_error for e in used) and len(used) <= 1:
+            return None
+        lines = ["Translation engines used:"]
+        for engine in used:
+            note = f" (unavailable: {engine.last_error})" if engine.last_error else ""
+            lines.append(f"  {engine.name}: {engine.requests} request(s){note}")
+        return "\n".join(lines)
+
+    def translate(self, text, target_lang, source_lang):
+        # When every engine is cooling down, try them all anyway rather than fail fast.
+        engines = [e for e in self.engines if e.available()] or self.engines
+        errors = []
+        for engine in engines:
+            try:
+                return engine.translate(text, target_lang, source_lang)
+            except EngineUnavailable as exc:
+                engine.disable(str(exc))
+                errors.append(f"{engine.name}: {exc}")
+            except Exception as exc:
+                errors.append(f"{engine.name}: {type(exc).__name__}: {exc}")
+        raise TranslationUnavailable("; ".join(errors))
+
+
+_CHAIN = TranslatorChain([GoogleEngine()])
+
+
+def configure_engines(microsoft_key=None, microsoft_region=None, deepl_key=None, use_argos=True):
+    """Set up the fallback chain: Google -> Microsoft -> DeepL -> Argos (offline)."""
+    global _CHAIN
+    engines = [GoogleEngine()]
+    if microsoft_key:
+        engines.append(MicrosoftEngine(microsoft_key, microsoft_region))
+    if deepl_key:
+        engines.append(DeepLEngine(deepl_key))
+    if use_argos:
+        try:
+            engines.append(ArgosEngine())
+        except ImportError:
+            pass  # argostranslate is optional
+    _CHAIN = TranslatorChain(engines)
+    print(f"Translation engines: {_CHAIN.describe()}")
+
+
+def translate_text(text, target_lang, source_lang="en"):
+    """Translate `text` with the first engine that succeeds.
+
+    `source_lang` is only used by the offline engine; online engines detect it.
+    """
     if text is None or str(text).strip() == "":
         return text
-    translator = GoogleTranslator(source='auto', target=normalize_lang(target_lang))
-    for attempt in range(_MAX_RETRIES):
-        _RATE_LIMITER.wait()
-        try:
-            return translator.translate(text)
-        except (TooManyRequests, RequestError) as exc:
-            if attempt == _MAX_RETRIES - 1:
-                raise
-            # Exponential backoff with jitter; also pushes back the shared limiter.
-            delay = min(2 ** attempt, 30) + random.uniform(0, 1)
-            _RATE_LIMITER._next_allowed = time.monotonic() + delay
-            time.sleep(delay)
-    # Unreachable, but keeps linters happy.
-    raise RuntimeError("translation retries exhausted")
+    return _CHAIN.translate(text, target_lang, source_lang)
 
 
 # Tolerates case changes, stray spaces and native digits (`\d` is Unicode-aware)
@@ -140,13 +402,13 @@ def _restore_placeholders(text, tokens):
     return _SENTINEL_RE.sub(_token, text)
 
 
-def translate_preserving_placeholders(text, target_lang):
+def translate_preserving_placeholders(text, target_lang, source_lang="en"):
     """Translate `text` while keeping {placeholder} tokens untouched."""
     if text is None or text.strip() == "":
         return text
 
     protected, restore = _protect_placeholders(text)
-    translated = translate_text(protected, target_lang) or protected
+    translated = translate_text(protected, target_lang, source_lang) or protected
     return _restore_placeholders(translated, restore)
 
 
@@ -178,33 +440,34 @@ def _split_segments(translated, count):
     return None if any(part == "" for part in parts) else parts
 
 
-def _translate_segments(texts, target_lang, protect_placeholders):
+def _translate_segments(texts, target_lang, protect_placeholders, source_lang):
     if len(texts) == 1:
         if protect_placeholders:
-            return [translate_preserving_placeholders(texts[0], target_lang)]
-        return [translate_text(texts[0], target_lang)]
+            return [translate_preserving_placeholders(texts[0], target_lang, source_lang)]
+        return [translate_text(texts[0], target_lang, source_lang)]
 
     protected = [_protect_placeholders(t) if protect_placeholders else (t, []) for t in texts]
     joined = "\n".join(f"{_SEGMENT_MARKER.format(i)}\n{text}" for i, (text, _) in enumerate(protected))
     try:
-        parts = _split_segments(translate_text(joined, target_lang) or "", len(texts))
-    except (TooManyRequests, RequestError):
-        raise  # halving would only send more requests to a server refusing them
+        parts = _split_segments(translate_text(joined, target_lang, source_lang) or "", len(texts))
+    except TranslationUnavailable:
+        raise  # halving would only send more requests to engines refusing them
     except Exception:
         parts = None
     if parts is None:
         mid = len(texts) // 2
-        return (_translate_segments(texts[:mid], target_lang, protect_placeholders)
-                + _translate_segments(texts[mid:], target_lang, protect_placeholders))
+        return (_translate_segments(texts[:mid], target_lang, protect_placeholders, source_lang)
+                + _translate_segments(texts[mid:], target_lang, protect_placeholders, source_lang))
     return [_restore_placeholders(part, restore) for part, (_, restore) in zip(parts, protected)]
 
 
-def translate_texts(texts, target_lang, protect_placeholders=True):
+def translate_texts(texts, target_lang, protect_placeholders=True, source_lang="en"):
     """Translate `texts` into one language with as few requests as possible, in order."""
     results = list(texts)
     todo = [i for i, text in enumerate(texts) if not _is_blank(text)]
     if todo:
-        translated = _translate_segments([texts[i] for i in todo], target_lang, protect_placeholders)
+        translated = _translate_segments([texts[i] for i in todo], target_lang, protect_placeholders,
+                                         source_lang)
         for i, value in zip(todo, translated):
             results[i] = value
     return results
@@ -246,6 +509,7 @@ def run_translations(chunks, translate_fn, workers, progress=None, describe=None
     failures = []
     if not chunks:
         return results
+    _CHAIN.reset_stats()
 
     def _safe(chunk):
         try:
@@ -269,12 +533,18 @@ def run_translations(chunks, translate_fn, workers, progress=None, describe=None
                 elif describe is not None and not error:
                     print(describe(item, translated))
 
+    # Finish the redrawn progress block before printing below it, or it overwrites these lines.
+    if progress is not None:
+        progress.done()
     if failures:
         print(f"\n{len(failures)} item(s) could not be translated and were left unchanged:")
         for item, error in failures[:20]:
             print(f"  {item}: {error}")
         if len(failures) > 20:
             print(f"  ... and {len(failures) - 20} more")
+    summary = _CHAIN.summary()
+    if summary:
+        print("\n" + summary)
     return results
 
 
@@ -434,7 +704,7 @@ def process_i18n_ts(file_path, force_translate, exclude_languages, source_lang, 
     progress = ProgressPrinter(len(worklist), recent=4)
     results = run_translations(
         chunk_worklist(worklist, lambda item: item[0], lambda item: item[2], batch_chars),
-        lambda chunk: translate_texts([item[2] for item in chunk], chunk[0][0]),
+        lambda chunk: translate_texts([item[2] for item in chunk], chunk[0][0], source_lang=source_lang),
         workers,
         progress=progress,
         describe=lambda item, translated: f"({item[0]}) {item[1]}: {item[2]} --> {translated}",
@@ -466,7 +736,7 @@ def process_i18n_ts(file_path, force_translate, exclude_languages, source_lang, 
     print("\ni18n TypeScript translation completed!")
 
 def process_resx_files(directory, force_translate, exclude_languages, workers=8,
-                       batch_chars=DEFAULT_BATCH_CHARS):
+                       batch_chars=DEFAULT_BATCH_CHARS, source_lang="en"):
     original_file = os.path.join(directory, "AppRes.resx")
     if not os.path.exists(original_file):
         print("Original resx file not found!")
@@ -509,7 +779,8 @@ def process_resx_files(directory, force_translate, exclude_languages, workers=8,
     progress = ProgressPrinter(len(worklist), recent=4)
     results = run_translations(
         chunk_worklist(worklist, lambda item: item[0], lambda item: item[3], batch_chars),
-        lambda chunk: translate_texts([item[3] for item in chunk], chunk[0][0][:2], protect_placeholders=False),
+        lambda chunk: translate_texts([item[3] for item in chunk], chunk[0][0][:2], protect_placeholders=False,
+                                      source_lang=source_lang),
         workers,
         progress=progress,
         describe=lambda item, translated: f"({item[0]}) {item[1]}: {item[3]} --> {translated}",
@@ -551,8 +822,17 @@ def main():
     parser.add_argument("--workers", type=int, default=8, help="Parallel translation workers (default: 8)")
     parser.add_argument("--batch-chars", type=int, default=DEFAULT_BATCH_CHARS,
                         help=f"Characters sent per request, many texts at once (default: {DEFAULT_BATCH_CHARS}, max 4900)")
+    parser.add_argument("--resx-source-lang", type=str, default="en",
+                        help="Language of AppRes.resx, used by the offline fallback (default: en)")
+    parser.add_argument("--microsoft-key", type=str, help="Azure Translator key: fallback after Google")
+    parser.add_argument("--microsoft-region", type=str,
+                        help="Azure Translator resource region (e.g. westeurope), unless the resource is global")
+    parser.add_argument("--deepl-key", type=str, help="DeepL API key: fallback after Microsoft")
+    parser.add_argument("--no-argos", action="store_true",
+                        help="Disable the offline Argos Translate fallback (used when argostranslate is installed)")
 
     args = parser.parse_args()
+    configure_engines(args.microsoft_key, args.microsoft_region, args.deepl_key, not args.no_argos)
 
     exclude_languages = args.exclude_languages.split(',') if args.exclude_languages else []
     batch_chars = max(1, min(args.batch_chars, 4900))
@@ -567,10 +847,12 @@ def main():
 
     if args.resx_directory:
         if args.force:
-            process_resx_files(args.resx_directory, True, exclude_languages, args.workers, batch_chars)
+            process_resx_files(args.resx_directory, True, exclude_languages, args.workers, batch_chars,
+                               args.resx_source_lang)
             sys.exit(0)
         elif args.new_only:
-            process_resx_files(args.resx_directory, False, exclude_languages, args.workers, batch_chars)
+            process_resx_files(args.resx_directory, False, exclude_languages, args.workers, batch_chars,
+                               args.resx_source_lang)
             sys.exit(0)
     
     while True:
@@ -591,7 +873,8 @@ def main():
 
         if choice in ["1", "2"]:
             directory = input("Enter the directory of resx files: ")
-            process_resx_files(directory, choice == "2", exclude_languages, workers)
+            process_resx_files(directory, choice == "2", exclude_languages, workers,
+                               source_lang=args.resx_source_lang)
         elif choice in ["3", "4"]:
             i18n_file = input("Enter the path to the i18n .ts file: ")
             source_lang = input("Source language key [en]: ").strip() or "en"

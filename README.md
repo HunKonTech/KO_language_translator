@@ -68,6 +68,8 @@ This Python script automates the translation of `.resx` resource files for a pro
 
 ### Dependencies
 - `deep-translator` (install using `pip install deep-translator`)
+- Optional: `argostranslate` for the offline fallback (`pip install argostranslate`). It pulls
+  in PyTorch (about 1 GB installed) and is not bundled into the PyInstaller executable.
 
 ### Command-Line Arguments
 - `--resx-directory <directory>`: Specifies the path to the `.resx` files directory.
@@ -96,6 +98,34 @@ This Python script automates the translation of `.resx` resource files for a pro
   costs a handful of requests instead of one per text; sending one request per text gets
   the IP blocked by Google. A batch whose markers do not come back intact is halved and
   sent again, down to one text per request.
+- `--microsoft-key <key>`: Azure AI Translator key; enables Microsoft as the first fallback
+  (free F0 tier: 2M characters/month).
+- `--microsoft-region <region>`: Region of the Azure Translator resource (e.g. `westeurope`).
+  Needed for regional and multi-service resources, not for global ones.
+- `--deepl-key <key>`: DeepL API key; enables DeepL as the next fallback. Free keys (ending
+  in `:fx`) use the Free API automatically (500k characters/month).
+- `--no-argos`: Disables the offline Argos Translate fallback, which is otherwise used
+  whenever `argostranslate` is installed.
+- `--resx-source-lang <lang>`: Language of `AppRes.resx` (default: `en`). Only Argos needs
+  it; the online services detect the source language. For i18n files `--i18n-source-lang`
+  is used.
+
+#### Translation fallback
+Translations go through the services in this order, each one only if configured:
+**Google -> Microsoft -> DeepL -> Argos (offline)**. A service that is rate limited, out of
+quota, rejects its key or cannot be reached is skipped for 5 minutes, and the batch goes to
+the next one. A service that fails on a single text (for example an unsupported language)
+only passes that text on. If every service is skipped, all are tried again rather than
+failing at once. Argos downloads its language models (about 100 MB per pair, pivoting
+through English when there is no direct model) the first time a pair is needed. At the end
+of a run, a summary shows how many requests each service handled and why any was skipped.
+- **Example:**
+  ```sh
+  python main.py --new-only --resx-directory /path/to/resx --microsoft-key <key> --microsoft-region westeurope --deepl-key <key>
+  ```
+
+> Keys passed on the command line end up in the shell history; in scripts, read them from
+> a secret store or environment variable and pass them as arguments, e.g. `--deepl-key "$DEEPL_KEY"`.
 
 ### TypeScript i18n support
 
@@ -252,6 +282,8 @@ Ez a Python szkript automatikusan lefordítja a `.resx` erőforrásfájlokat egy
 
 ### Függőségek
 - `deep-translator` (telepíthető `pip install deep-translator` paranccsal)
+- Opcionális: `argostranslate` az offline fallbackhez (`pip install argostranslate`). Behúzza
+  a PyTorch-ot (telepítve kb. 1 GB), és a PyInstaller-es futtatható fájlba nem kerül bele.
 
 ### Parancssori argumentumok
 - `--resx-directory <könyvtár>`: Az `.resx` fájlokat tartalmazó könyvtár elérési útja.
@@ -280,6 +312,35 @@ Ez a Python szkript automatikusan lefordítja a `.resx` erőforrásfájlokat egy
   szét, így egy nyelv néhány kérésbe kerül szövegenkénti egy helyett; a szövegenkénti
   kérésekért a Google letiltja az IP-címet. Ha egy köteg jelölői nem érkeznek vissza
   épen, a köteg megfeleződik és újra elmegy, legrosszabb esetben szövegenként.
+- `--microsoft-key <kulcs>`: Azure AI Translator kulcs; bekapcsolja a Microsoftot első
+  fallbackként (ingyenes F0 csomag: havi 2M karakter).
+- `--microsoft-region <régió>`: Az Azure Translator erőforrás régiója (pl. `westeurope`).
+  Regionális és multi-service erőforrásnál kell, globálisnál nem.
+- `--deepl-key <kulcs>`: DeepL API kulcs; bekapcsolja a DeepL-t következő fallbackként. Az
+  ingyenes (`:fx` végű) kulcsok automatikusan a Free API-t használják (havi 500k karakter).
+- `--no-argos`: Kikapcsolja az offline Argos Translate fallbacket, amely egyébként mindig
+  működik, ha az `argostranslate` telepítve van.
+- `--resx-source-lang <nyelv>`: Az `AppRes.resx` nyelve (alapértelmezés: `en`). Csak az
+  Argosnak kell; az online szolgáltatók felismerik a forrásnyelvet. i18n fájloknál az
+  `--i18n-source-lang` érték számít.
+
+#### Fordítási fallback
+A fordítás ebben a sorrendben megy végig a szolgáltatókon, mindegyiken csak ha be van
+állítva: **Google -> Microsoft -> DeepL -> Argos (offline)**. Ha egy szolgáltató
+rate-limitel, elfogyott a kerete, elutasítja a kulcsot vagy nem érhető el, 5 percre
+kimarad, és a köteg a következőhöz kerül. Ha egy szolgáltató csak egy szövegnél hibázik
+(pl. nem támogatott nyelv), csak azt a szöveget adja tovább. Ha minden szolgáltató
+kimaradna, újra mindet megpróbálja, ahelyett hogy azonnal hibát adna. Az Argos egy
+nyelvpár első használatakor letölti a modelleket (páronként kb. 100 MB; ha nincs közvetlen
+modell, angolon keresztül fordít). A futás végén összesítő mutatja, melyik szolgáltató hány
+kérést kapott, és miért maradt ki valamelyik.
+- **Példa:**
+  ```sh
+  python main.py --new-only --resx-directory /path/to/resx --microsoft-key <kulcs> --microsoft-region westeurope --deepl-key <kulcs>
+  ```
+
+> A parancssorban átadott kulcsok bekerülnek a shell előzményekbe; szkriptekben titoktárból
+> vagy környezeti változóból olvasd be és add át argumentumként, pl. `--deepl-key "$DEEPL_KEY"`.
 
 ### TypeScript i18n támogatás
 
